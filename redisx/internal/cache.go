@@ -90,7 +90,10 @@ func (c *Cache) Purge() {
 	size := 0
 	for e := c.ll.Front(); e != nil; e = e.Next() {
 		key := e.Value.(string)
-		entry := c.entries[key]
+		entry, ok := c.entries[key]
+		if !ok {
+			continue
+		}
 
 		if time.Now().After(entry.expires) {
 			c.ll.Remove(entry.ref)

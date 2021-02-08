@@ -325,7 +325,51 @@ func (wc wrappedConn) Receive() (reply interface{}, err error) { return wc.conn.
 type cachingInProgressPlaceholder struct{}
 
 func (wc wrappedConn) Do(cmd string, args ...interface{}) (interface{}, error) {
-	if strings.ToLower(cmd) != "get" || len(args) == 0 {
+	lcmd := strings.ToLower(cmd)
+	switch lcmd {
+	case "get":
+		key, ok := args[0].(string)
+		if !ok {
+			return wc.conn.Do(cmd, args...)
+		}
+
+		wc.c.mu.Lock()
+		entry := wc.c.cache.Get(key)
+		wc.c.mu.Unlock()
+
+		if entry != nil {
+			return entry, nil
+		}
+	case "mget":
+		res := make([]interface{}, 0, len(args))
+		missing := make([]interface{}, 0, 2)
+		wc.c.mu.Lock()
+		for _, a := range args {
+			key, ok := a.(string)
+			if !ok {
+				return wc.conn.Do(cmd, args...)
+			}
+
+			entry := wc.c.cache.Get(key)
+			if entry != nil {
+				res = append(res, entry)
+			} else {
+				missing = append(missing, key)
+			}
+		}
+		wc.c.mu.Unlock()
+
+		if len(missing) > 0 {
+			rp, err := wc.exec(cmd, missing...)
+			if err != nil {
+				return rp, err
+			}
+
+			res = append(res, rp.([]interface{})...)
+		}
+
+		return res, nil
+	default:
 		return wc.conn.Do(cmd, args...)
 	}
 
@@ -342,70 +386,131 @@ func (wc wrappedConn) Do(cmd string, args ...interface{}) (interface{}, error) {
 		return entry, nil
 	}
 
-	return wc.exec(key, cmd, args...)
+	return wc.exec(cmd, args...)
 }
 
 const defaultTTL = 600 // 10 minutes
 
-func (wc wrappedConn) exec(key string, cmd string, args ...interface{}) (interface{}, error) {
-	// 1
-	if wc.shouldTrack(key) {
-		if err := wc.conn.Send("CLIENT", "CACHING", "yes"); err != nil {
+func (wc wrappedConn) exec(cmd string, args ...interface{}) (interface{}, error) {
+	var reply interface{}
+	var err error
+
+	switch strings.ToLower(cmd) {
+	case "get":
+		key := args[0].(string)
+
+		// 1
+		if wc.shouldTrack(key) {
+			if err := wc.conn.Send("CLIENT", "CACHING", "yes"); err != nil {
+				return nil, err
+			}
+		}
+
+		// 2
+		if err := wc.conn.Send(cmd, args...); err != nil {
 			return nil, err
 		}
-	}
 
-	// 2
-	if err := wc.conn.Send(cmd, args...); err != nil {
-		return nil, err
-	}
+		// 3
+		if wc.shouldCache(key) {
+			wc.c.mu.Lock()
+			wc.c.cache.Set(key, cachingInProgressPlaceholder{}, defaultTTL)
+			wc.c.mu.Unlock()
 
-	// 3
-	if wc.shouldCache(key) {
-		wc.c.mu.Lock()
-		wc.c.cache.Set(key, cachingInProgressPlaceholder{}, defaultTTL)
-		wc.c.mu.Unlock()
+			if err := wc.conn.Send("TTL", key); err != nil {
+				return nil, err
+			}
+		}
 
-		if err := wc.conn.Send("TTL", key); err != nil {
+		// Flush command buffer
+		if err := wc.conn.Flush(); err != nil {
 			return nil, err
 		}
-	}
 
-	// Flush command buffer
-	if err := wc.conn.Flush(); err != nil {
-		return nil, err
-	}
-
-	// 1
-	if wc.shouldTrack(key) {
-		if _, err := wc.conn.Receive(); err != nil {
-			return nil, err
+		// 1
+		if wc.shouldTrack(key) {
+			if _, err := wc.conn.Receive(); err != nil {
+				return nil, err
+			}
 		}
-	}
 
-	// 2
-	reply, err := wc.conn.Receive()
-	if err != nil {
-		return reply, err
-	}
-
-	// 3
-	if wc.shouldCache(key) {
-		ttl, err := redis.Int(wc.conn.Receive())
+		// 2
+		reply, err = wc.conn.Receive()
 		if err != nil {
+			return reply, err
+		}
+
+		// 3
+		if wc.shouldCache(key) {
+			ttl, err := redis.Int(wc.conn.Receive())
+			if err != nil {
+				return nil, err
+			}
+
+			if ttl < 0 {
+				ttl = defaultTTL
+			}
+
+			wc.c.mu.Lock()
+			// avoid caching stale responses
+			if _, ok := wc.c.cache.Get(key).(cachingInProgressPlaceholder); ok {
+				wc.c.cache.Set(key, reply, ttl)
+			}
+			wc.c.mu.Unlock()
+		}
+
+	case "mget":
+		// 2
+		if err := wc.conn.Send(cmd, args...); err != nil {
 			return nil, err
 		}
 
-		if ttl < 0 {
-			ttl = defaultTTL
+		// 3
+		for _, k := range args {
+			key := k.(string)
+			if wc.shouldCache(key) {
+				wc.c.mu.Lock()
+				wc.c.cache.Set(key, cachingInProgressPlaceholder{}, defaultTTL)
+				wc.c.mu.Unlock()
+
+				if err := wc.conn.Send("TTL", key); err != nil {
+					return nil, err
+				}
+			}
 		}
 
-		wc.c.mu.Lock()
-		// avoid caching stale responses
-		if _, ok := wc.c.cache.Get(key).(cachingInProgressPlaceholder); ok {
-			wc.c.cache.Set(key, reply, ttl)
+		// Flush command buffer
+		if err := wc.conn.Flush(); err != nil {
+			return nil, err
 		}
-		wc.c.mu.Unlock()
+
+		// 2
+		reply, err = wc.conn.Receive()
+		if err != nil {
+			return reply, err
+		}
+
+		// 3
+		for i, v := range reply.([]interface{}) {
+			key := args[i].(string)
+			if wc.shouldCache(key) {
+				ttl, err := redis.Int(wc.conn.Receive())
+				if err != nil {
+					return nil, err
+				}
+
+				if ttl < 0 {
+					ttl = defaultTTL
+				}
+
+				wc.c.mu.Lock()
+				// avoid caching stale responses
+				if _, ok := wc.c.cache.Get(key).(cachingInProgressPlaceholder); ok {
+					wc.c.cache.Set(key, v, ttl)
+				}
+				wc.c.mu.Unlock()
+			}
+		}
 	}
 
 	return reply, nil
