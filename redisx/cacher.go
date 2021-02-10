@@ -70,15 +70,15 @@ func (p prefixMatcher) Match(key string) bool {
 
 // ConnGetter is interface used to get redis connection for Cacher usage
 type ConnGetter interface {
-	Get() redis.Conn
+	Get(ctx context.Context) redis.Conn
 }
 
 // ConnGetterFunc is an adapter type for ConnGetter interface
-type ConnGetterFunc func() redis.Conn
+type ConnGetterFunc func(ctx context.Context) redis.Conn
 
 // Get just calls underlying function
-func (f ConnGetterFunc) Get() redis.Conn {
-	return f()
+func (f ConnGetterFunc) Get(ctx context.Context) redis.Conn {
+	return f(ctx)
 }
 
 var errNilGetter = errors.New("redisx cacher: getter is nil")
@@ -93,7 +93,7 @@ func (c *Cacher) Run(ctx context.Context, setupDoneChan chan<- struct{}) error {
 	}
 
 	// Connection used for invalidation
-	conn := c.Getter.Get()
+	conn := c.Getter.Get(ctx)
 	if conn == nil {
 		close(setupDoneChan)
 		return errors.New("getter returned nil connection")
@@ -121,7 +121,7 @@ func (c *Cacher) Run(ctx context.Context, setupDoneChan chan<- struct{}) error {
 		return err
 	}
 
-	pingConn := c.Getter.Get()
+	pingConn := c.Getter.Get(ctx)
 	if conn == nil {
 		close(setupDoneChan)
 		return errors.New("getter returned nil connection")
@@ -240,11 +240,11 @@ outer:
 // If nil Matcher is passed all keys are subjected to cache.
 // When using Broadcast strategy Matcher should be created with NewPrefixMatcher.
 // Caller is responsible for closing connection.
-func (c *Cacher) Get(m Matcher) redis.Conn {
+func (c *Cacher) Get(ctx context.Context, m Matcher) redis.Conn {
 	if c.Getter == nil {
 		panic(errNilGetter)
 	}
-	return c.Wrap(c.Getter.Get(), m)
+	return c.Wrap(c.Getter.Get(ctx), m)
 }
 
 var errNotRunning = errors.New("redisx cacher: invalidation process is not running")
