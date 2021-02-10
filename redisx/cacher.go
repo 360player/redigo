@@ -301,6 +301,13 @@ func (c *Cacher) Stats() CacheStats {
 	return CacheStats{size, hits, misses}
 }
 
+// Flush local cache
+func (c *Cacher) Flush() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cache = internal.NewCache(c.MaxSize)
+}
+
 // CacheStats contain statistics about local cache
 type CacheStats struct {
 	Entries int // Number of keys in the cache
@@ -337,27 +344,33 @@ func (wc wrappedConn) Do(cmd string, args ...interface{}) (interface{}, error) {
 		entry := wc.c.cache.Get(key)
 		wc.c.mu.Unlock()
 
-		if entry != nil {
+		_, ok = entry.(cachingInProgressPlaceholder)
+		if entry != nil && !ok {
 			return entry, nil
 		}
 	case "mget":
-		res := make([]interface{}, 0, len(args))
-		missing := make([]interface{}, 0, 2)
-		wc.c.mu.Lock()
-		for _, a := range args {
+		idxMap := make(map[string]int)
+		res := make([]interface{}, len(args))
+		missing := make([]interface{}, 0, len(args))
+		for i, a := range args {
 			key, ok := a.(string)
 			if !ok {
 				return wc.conn.Do(cmd, args...)
 			}
 
+			idxMap[key] = i
+
+			wc.c.mu.Lock()
 			entry := wc.c.cache.Get(key)
-			if entry != nil {
-				res = append(res, entry)
+			wc.c.mu.Unlock()
+
+			_, ok = entry.(cachingInProgressPlaceholder)
+			if entry != nil && !ok {
+				res[i] = entry
 			} else {
 				missing = append(missing, key)
 			}
 		}
-		wc.c.mu.Unlock()
 
 		if len(missing) > 0 {
 			rp, err := wc.exec(cmd, missing...)
@@ -365,7 +378,12 @@ func (wc wrappedConn) Do(cmd string, args ...interface{}) (interface{}, error) {
 				return rp, err
 			}
 
-			res = append(res, rp.([]interface{})...)
+			replies := rp.([]interface{})
+			for i, k := range missing {
+				key := k.(string)
+				idx := idxMap[key]
+				res[idx] = replies[i]
+			}
 		}
 
 		return res, nil
@@ -382,7 +400,8 @@ func (wc wrappedConn) Do(cmd string, args ...interface{}) (interface{}, error) {
 	entry := wc.c.cache.Get(key)
 	wc.c.mu.Unlock()
 
-	if entry != nil {
+	_, ok = entry.(cachingInProgressPlaceholder)
+	if entry != nil && !ok {
 		return entry, nil
 	}
 
