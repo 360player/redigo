@@ -192,7 +192,7 @@ outer:
 			}
 
 			keys, err := redis.Strings(event[2], nil)
-			if err != nil || err == redis.ErrNil {
+			if err != nil && err != redis.ErrNil {
 				continue outer
 			}
 
