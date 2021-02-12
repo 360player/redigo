@@ -52,15 +52,15 @@ func TestCacherBroadcastStrategy(t *testing.T) {
 
 func TestCacherWithoutInvalidationProcess(t *testing.T) {
 	c := &Cacher{
-		Getter: ConnGetterFunc(func() redis.Conn { return nil }),
+		Getter: ConnGetterFunc(func(ctx context.Context) redis.Conn { return nil }),
 	}
 
 	assert.PanicsWithValue(t, errNotRunning, func() {
-		c.Get(nil)
+		c.Get(context.Background(), nil)
 	})
 
 	assert.PanicsWithValue(t, errNotRunning, func() {
-		c.Wrap(c.Get(nil), nil)
+		c.Wrap(c.Get(context.Background(), nil), nil)
 	})
 }
 
@@ -74,16 +74,16 @@ func TestCacherNilGetter(t *testing.T) {
 	})
 
 	assert.PanicsWithValue(t, errNilGetter, func() {
-		c.Get(nil)
+		c.Get(context.Background(), nil)
 	})
 }
 
 func TestCacherNoConnection(t *testing.T) {
 	calls := 0
-	getter := ConnGetterFunc(func() redis.Conn {
+	getter := ConnGetterFunc(func(ctx context.Context) redis.Conn {
 		if calls == 0 {
 			calls++
-			return dialGetter()
+			return dialGetter(ctx)
 		}
 		return errorConn{errors.New("sorry no network")}
 	})
@@ -93,7 +93,7 @@ func TestCacherNoConnection(t *testing.T) {
 	c, cleanup := setupCacher(t, getter, Tracking)
 	defer cleanup()
 
-	conn := c.Wrap(dialGetter(), nil)
+	conn := c.Wrap(dialGetter(context.Background()), nil)
 
 	// Cache some keys
 	_, err := conn.Do("SET", "key", "value")
@@ -117,7 +117,7 @@ func TestCacherTTL(t *testing.T) {
 	c, cleanup := setupCacher(t, dialGetter, Tracking)
 	defer cleanup()
 
-	conn := c.Get(nil)
+	conn := c.Get(context.Background(), nil)
 
 	// Cache some keys
 	_, err := conn.Do("SET", "foo", "value", "EX", 1)
@@ -141,10 +141,7 @@ func TestCacherTTL(t *testing.T) {
 	assert.Equal(t, 1, c.Stats().Entries)
 }
 
-var dialGetter = ConnGetterFunc(func() redis.Conn {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
+var dialGetter = ConnGetterFunc(func(ctx context.Context) redis.Conn {
 	conn, err := redis.DialContext(ctx, "tcp", ":6379")
 	if err != nil {
 		panic(fmt.Sprintf("Failed to connect to redis: %v", err))
@@ -177,7 +174,7 @@ func setupCacher(t *testing.T, getter ConnGetter, strategy cachingStrategy) (c *
 
 func hasBeenCachedHelper(t *testing.T, c *Cacher) func(Matcher, string) bool {
 	return func(m Matcher, key string) bool {
-		conn := c.Get(m)
+		conn := c.Get(context.Background(), m)
 		defer conn.Close()
 
 		beforeCount := c.Stats().Entries
