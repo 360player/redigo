@@ -59,6 +59,10 @@ func NewPrefixMatcher(prefixes []string) Matcher {
 }
 
 func (p prefixMatcher) Match(key string) bool {
+	if len(p) == 0 {
+		return true
+	}
+
 	for _, prefix := range p {
 		if strings.HasPrefix(key, prefix) {
 			return true
