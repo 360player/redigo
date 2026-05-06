@@ -163,6 +163,16 @@ type Pool struct {
 
 	chInitialized uint32 // set to 1 when field ch is initialized
 
+	// Counters incremented atomically (do NOT require mu).
+	// waitCanceled: outer-select ctx-fired while waiting; no token consumed.
+	// waitLeaked:   inner-select ctx-fired AFTER a token was consumed but
+	//               before the wait succeeded; the token is permanently lost
+	//               from p.ch. Non-zero values here indicate the well-known
+	//               waitVacantConn race; rate corresponds to the rate of
+	//               pool-capacity loss.
+	waitCanceled int64
+	waitLeaked   int64
+
 	mu           sync.Mutex    // mu protects the following fields
 	closed       bool          // set to true when the pool is closed.
 	active       int           // the number of open connections in the pool
@@ -283,16 +293,34 @@ type PoolStats struct {
 	// WaitDuration is the total time blocked waiting for a new connection.
 	// This value is currently not guaranteed to be 100% accurate.
 	WaitDuration time.Duration
+
+	// TokensAvailable is the number of free slots currently in the wait
+	// channel. Together with in-use connections (ActiveCount-IdleCount) this
+	// must equal MaxActive; any deficit indicates leaked tokens. Reads 0
+	// before lazyInit (no Get has run yet on this pool).
+	TokensAvailable int
+
+	// WaitCanceledCount is the total number of Get calls whose ctx fired
+	// while waiting on the channel without a token being consumed.
+	WaitCanceledCount int64
+
+	// WaitLeakedCount is the total number of Get calls that consumed a token
+	// from the channel but returned a ctx error before the wait could
+	// complete; each one permanently shrinks effective pool capacity.
+	WaitLeakedCount int64
 }
 
 // Stats returns pool's statistics.
 func (p *Pool) Stats() PoolStats {
 	p.mu.Lock()
 	stats := PoolStats{
-		ActiveCount:  p.active,
-		IdleCount:    p.idle.count,
-		WaitCount:    p.waitCount,
-		WaitDuration: p.waitDuration,
+		ActiveCount:       p.active,
+		IdleCount:         p.idle.count,
+		WaitCount:         p.waitCount,
+		WaitDuration:      p.waitDuration,
+		TokensAvailable:   len(p.ch),
+		WaitCanceledCount: atomic.LoadInt64(&p.waitCanceled),
+		WaitLeakedCount:   atomic.LoadInt64(&p.waitLeaked),
 	}
 	p.mu.Unlock()
 
@@ -387,10 +415,12 @@ func (p *Pool) waitVacantConn(ctx context.Context) (waited time.Duration, err er
 		// because `select` picks a random `case` if several of them are "ready".
 		select {
 		case <-ctx.Done():
+			atomic.AddInt64(&p.waitLeaked, 1)
 			return 0, ctx.Err()
 		default:
 		}
 	case <-ctx.Done():
+		atomic.AddInt64(&p.waitCanceled, 1)
 		return 0, ctx.Err()
 	}
 
